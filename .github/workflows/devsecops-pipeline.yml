@@ -1,0 +1,157 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # necesario solo para subir SARIF a Code Scanning
+
+env:
+  CVSS_THRESHOLD: "7"      # Politica: CVSS >= 7.0 (HIGH/CRITICAL) => FAIL
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. SAST - Semgrep
+  # ------------------------------------------------------------------
+  sast-semgrep:
+    name: "SAST - Semgrep Code Scanning"
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - name: Checkout del codigo
+        uses: actions/checkout@v4
+
+      - name: Ejecutar Semgrep (genera SARIF + JSON)
+        run: |
+          semgrep scan \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --config p/nodejs \
+            --metrics=off \
+            --sarif-output=semgrep-results.sarif \
+            --json-output=semgrep-results.json
+
+      - name: Subir artefactos de Semgrep
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-reports
+          path: |
+            semgrep-results.sarif
+            semgrep-results.json
+
+      - name: Subir SARIF a GitHub Code Scanning (opcional)
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: semgrep-results.sarif
+
+      # QUALITY GATE SAST: falla si hay hallazgos con severidad ERROR (HIGH)
+      - name: "Quality Gate SAST (falla si hay hallazgos ERROR/HIGH)"
+        run: |
+          python3 - << 'PY'
+          import json, sys
+          data = json.load(open("semgrep-results.json"))
+          sev = {"ERROR": 0, "WARNING": 0, "INFO": 0}
+          for r in data.get("results", []):
+              s = r["extra"]["severity"]
+              sev[s] = sev.get(s, 0) + 1
+          print("Hallazgos Semgrep ->", sev)
+          if sev["ERROR"] > 0:
+              print(f"::error::QUALITY GATE FALLIDO: {sev['ERROR']} hallazgos ERROR/HIGH en SAST")
+              sys.exit(1)
+          print("Quality Gate SAST: OK")
+          PY
+
+  # ------------------------------------------------------------------
+  # 2. SBOM - CycloneDX (Syft)
+  # ------------------------------------------------------------------
+  sbom-cyclonedx:
+    name: "Generacion de SBOM (CycloneDX)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del codigo
+        uses: actions/checkout@v4
+
+      - name: Generar SBOM con Syft (CycloneDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: "."
+          format: cyclonedx-json
+          output-file: "sbom.cyclonedx.json"
+          upload-artifact: false
+
+      - name: Subir artefacto SBOM (CycloneDX)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cyclonedx.json
+
+  # ------------------------------------------------------------------
+  # 3. SCA - OWASP Dependency-Check
+  # ------------------------------------------------------------------
+  sca-dependency-check:
+    name: "SCA - OWASP Dependency-Check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del codigo
+        uses: actions/checkout@v4
+
+      - name: Setup Node (para resolver arbol de dependencias)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Generar package-lock.json si no existe
+        run: |
+          [ -f package-lock.json ] || npm install --package-lock-only --ignore-scripts
+
+      - name: OWASP Dependency-Check Scan
+        uses: dependency-check/Dependency-Check_Action@main
+        id: depcheck
+        with:
+          project: "AppSegura"
+          path: "."
+          format: "ALL"
+          out: "reports"
+          args: >
+            --failOnCVSS ${{ env.CVSS_THRESHOLD }}
+            --enableExperimental
+            --suppression dependency-check-suppression.xml
+            --nvdApiKey ${{ secrets.NVD_API_KEY }}
+
+      - name: Subir reporte SCA
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-report
+          path: reports/
+
+  # ------------------------------------------------------------------
+  # 4. QUALITY GATE global
+  # ------------------------------------------------------------------
+  quality-gate:
+    name: "Quality Gate (politica HIGH/CRITICAL)"
+    runs-on: ubuntu-latest
+    needs: [sast-semgrep, sbom-cyclonedx, sca-dependency-check]
+    if: always()
+    steps:
+      - name: Evaluar resultados
+        run: |
+          echo "SAST : ${{ needs.sast-semgrep.result }}"
+          echo "SBOM : ${{ needs.sbom-cyclonedx.result }}"
+          echo "SCA  : ${{ needs.sca-dependency-check.result }}"
+          if [ "${{ needs.sast-semgrep.result }}" != "success" ] || \
+             [ "${{ needs.sca-dependency-check.result }}" != "success" ] || \
+             [ "${{ needs.sbom-cyclonedx.result }}" != "success" ]; then
+            echo "::error::QUALITY GATE FALLIDO: hay hallazgos HIGH/CRITICAL (SAST o SCA) o un job fallo."
+            exit 1
+          fi
+          echo "QUALITY GATE APROBADO"
